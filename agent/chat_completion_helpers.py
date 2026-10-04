@@ -2876,6 +2876,10 @@ class _StreamingCall(StreamingWaitMonitor):
         self.stream_attempt_lock = threading.Lock()
         self.stream_attempt_state = {"current": 0, "cancelled": set(), "discarded_chunks": 0, "discarded_bytes": 0}
         self._stale_counted_attempts: set[int] = set()  # breaker counts each attempt once
+        # Attempts this monitor has already killed. A repeat kill of the SAME id
+        # means the abort could not unwind the worker, so the stall is surfaced
+        # instead of held silent (#132606).
+        self._stale_killed_attempts: set[int] = set()
         self.managed_stream_holder = {"stream": None}
         # Per-attempt: single-writer token, request-local client, raw HTTP response (chat wire).
         self._writer_token = self._attempt_request_client = self._attempt_stream_response = None
@@ -3940,7 +3944,17 @@ class _StreamingCall(StreamingWaitMonitor):
         client so the retry loop opens a fresh one. The shared client is never
         closed from this (stranger) thread — earlier stale-killed workers may
         still be unwinding SSL BIOs (FD-recycle corruption); the OpenAI primary
-        is replaced lazily."""
+        is replaced lazily.
+
+        A kill is also the only chance this path has to REPORT an unrecoverable
+        stall. When the abort cannot unwind the worker — a dead Windows proactor
+        self-pipe leaves the chunk pull parked with no exception (#132606) — the
+        attempt id never advances, so no retry is in flight and ``run()`` would
+        otherwise have nothing to translate and the turn would sit silent until
+        the stale window expired a second time. Surface it as the retryable
+        TimeoutError the Bedrock sibling already raises, and run the breaker so a
+        dead transport exhausts the attempt budget instead of costing one turn
+        per retry."""
         _est_ctx = estimate_request_context_tokens(self.api_kwargs)
         logger.warning(
             "Stream stale for %.0fs (threshold %.0fs) — no chunks received. model=%s context=~%s tokens. Killing connection.",
@@ -3957,11 +3971,53 @@ class _StreamingCall(StreamingWaitMonitor):
             self._cancel_current_stream_attempt("stale_stream_kill")
             self.clients.close_once("stale_stream_kill")
         self._shutdown_stale_attempt_socket(_killed_response)
+        # The attempt this kill fired on. A RECOVERED kill advances this: the abort
+        # raised inside the worker's body read, ``_handle_stream_error`` classified
+        # it transient, and the retry loop opened a new attempt. The same attempt id
+        # coming back around means the abort could not unwind the reader at all
+        # (#132606) — no retry is in flight, so ``run()`` has nothing to translate
+        # and the stall must be surfaced rather than held silent.
+        with self.stream_attempt_lock:
+            killed_attempt = int(self.stream_attempt_state["current"])
+        already_killed = killed_attempt in self._stale_killed_attempts
+        self._stale_killed_attempts.add(killed_attempt)
         self._count_stale_attempt()
         # Reset the timer so we don't kill repeatedly while the worker unwinds.
         self.last_chunk_time["t"] = time.time()
         self.agent._emit_diagnostic_wait(f"⚠ no output from provider for {int(elapsed)}s — reconnecting...")
         self.agent._touch_activity(f"stale stream detected after {int(elapsed)}s, reconnecting")
+        if self.result["error"] is not None:
+            return  # An earlier kill already surfaced this stall.
+        if already_killed and not self._worker_finished_while_stale():
+            # A full stale window passed and the worker is still on the same
+            # attempt: the transport is dead, not slow.
+            self._surface_unrecoverable_stale(elapsed)
+
+    def _worker_finished_while_stale(self) -> bool:
+        """True when the worker thread is gone, so a still-current attempt means
+        the call already ended on its own rather than that it is wedged."""
+        worker = getattr(self, "worker", None)
+        return worker is not None and not worker.is_alive()
+
+    def _surface_unrecoverable_stale(self, elapsed: float) -> None:
+        """Hand the agent loop a retryable error for a stall the kill could not
+        recover, and run the stale breaker.
+
+        Transport-class (``TimeoutError``), so ``classify_api_error`` routes it
+        through the ordinary retry/fallback path instead of failing the turn. The
+        breaker runs first and may raise: this runs on the MONITOR thread, so an
+        escaping exception would kill the loop that owns the call and reproduce
+        the silence this path exists to end — convert it instead.
+        """
+        try:
+            _check_stale_giveup(self.agent)
+        except RuntimeError as giveup:
+            self.result["error"] = giveup
+            return
+        self.result["error"] = TimeoutError(
+            f"Stream produced no chunks for {int(elapsed)}s (threshold {int(self._stream_stale_timeout or 0)}s) "
+            f"and the abort could not unwind the reader — treating the transport as dead and retrying."
+        )
 
     def _abort_for_interrupt(self, stale_elapsed: float) -> None:
         """/stop seen by the monitor: mark cancelled, abort the request-local
