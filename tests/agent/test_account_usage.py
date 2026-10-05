@@ -161,6 +161,44 @@ def test_codex_window_labels_follow_duration_with_positional_fallback(monkeypatc
     assert [w.label for w in snapshot.windows] == ["Session", "Weekly"]
 
 
+def _anthropic_snapshot(monkeypatch, payload):
+    """Drive the real Anthropic fetcher with a stubbed transport; returns (snapshot, calls)."""
+    calls = []
+    monkeypatch.setattr(account_usage, "resolve_anthropic_token", lambda: "oauth-access-token")
+    monkeypatch.setattr(account_usage, "_is_oauth_token", lambda token: True)
+    monkeypatch.setattr(account_usage.httpx, "Client", lambda timeout: _FakeClient(calls, payload))
+    snapshot = account_usage.fetch_account_usage("anthropic")
+    return snapshot, calls
+
+
+def test_anthropic_utilization_is_reported_as_the_percent_it_already_is(monkeypatch):
+    """#133106: ``utilization`` arrives as a PERCENT, so 1% must stay 1% and not be rescaled to 100%.
+
+    The retired ``fraction=True`` heuristic multiplied any value <= 1 by 100, so every real
+    utilization in (0, 1] was reported 100x too high — a 1% session read as a full quota and
+    tripped threshold alerts. Values above 1 are the negative control: a fix that simply divided
+    everything by 100 would pass the first assertion and fail these.
+    """
+    payload = {
+        "five_hour": {"utilization": 1.0, "resets_at": "2026-10-04T20:59:59.988717+00:00"},
+        "seven_day": {"utilization": 0.0, "resets_at": "2026-10-11T03:59:59.988740+00:00"},
+        "seven_day_opus": {"utilization": 5.0},
+        "seven_day_sonnet": {"utilization": 21.0},
+    }
+    snapshot, calls = _anthropic_snapshot(monkeypatch, payload)
+
+    assert snapshot is not None
+    assert [(w.label, w.used_percent) for w in snapshot.windows] == [
+        ("Current session", 1.0),
+        ("Current week", 0.0),
+        ("Opus week", 5.0),
+        ("Sonnet week", 21.0),
+    ]
+    # A reset timestamp still parses; the sub-1% window is the one that used to be destroyed.
+    assert snapshot.windows[0].reset_at is not None
+    assert calls[0]["url"] == "https://api.anthropic.com/api/oauth/usage"
+
+
 def test_codex_snapshot_exposes_exact_raw_payload_with_one_get(monkeypatch, codex_usage_payload):
     """#79695: the decoded body rides along untouched (unknown fields included), from the single GET."""
     codex_usage_payload["future_field"] = {"nested": [1, 2]}

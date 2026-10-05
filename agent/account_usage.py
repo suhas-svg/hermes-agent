@@ -387,19 +387,24 @@ def _get_json(url: str, headers: dict[str, str], *, timeout: float) -> dict:
 
 
 def _usage_windows(
-    source: dict, mapping: tuple[tuple[str, str], ...], used_key: str, reset_key: str, *, fraction: bool = False
+    source: dict, mapping: tuple[tuple[str, str], ...], used_key: str, reset_key: str
 ) -> list[AccountUsageWindow]:
-    """Build windows from ``source[key][used_key]``; ``fraction`` scales values <= 1 to percent."""
+    """Build windows from ``source[key][used_key]``, which every provider publishes as a PERCENT.
+
+    There is deliberately no fraction/percent guess here: a ``used <= 1`` heuristic read a real
+    Anthropic ``utilization`` of 1% as a 0-1 fraction and reported 100% (#133106). A value of
+    exactly 1.0 is ambiguous either way, so prefer the documented unit — under-reporting usage
+    is safer than firing a false quota-exhausted alert. A provider that ever does ship a 0-1
+    fraction has to say so in its own window builder rather than lean on this shared helper.
+    """
     windows: list[AccountUsageWindow] = []
     for key, label in mapping:
         window = source.get(key) or {}
         used = window.get(used_key)
         if used is None:
             continue
-        used = float(used)
-        if fraction and used <= 1:
-            used *= 100
-        windows.append(AccountUsageWindow(label=label, used_percent=used, reset_at=_parse_dt(window.get(reset_key))))
+        windows.append(AccountUsageWindow(label=label, used_percent=float(used),
+                                          reset_at=_parse_dt(window.get(reset_key))))
     return windows
 
 
@@ -600,7 +605,7 @@ def _fetch_anthropic_account_usage(
     payload = _get_json("https://api.anthropic.com/api/oauth/usage", headers, timeout=15.0)
     windows = _usage_windows(
         payload, (("five_hour", "Current session"), ("seven_day", "Current week"), ("seven_day_opus", "Opus week"),
-                  ("seven_day_sonnet", "Sonnet week")), "utilization", "resets_at", fraction=True,
+                  ("seven_day_sonnet", "Sonnet week")), "utilization", "resets_at",
     )
     details: list[str] = []
     extra = payload.get("extra_usage") or {}
