@@ -77,6 +77,36 @@ it('restores a frozen send after remount and retires only its acknowledged exact
   }
 })
 
+it('discards a restored unconfirmed send, unlocks the composer, and keeps its draft', async () => {
+  const binding = { connectionId: 'remote', profile: 'team', roomId: 'discard-restored' }
+  await prepareCanonicalGroupSend(binding, { text: 'Stuck draft', attachments: [] })
+  request.mockImplementation(async (_route, method) => method === 'groups.state'
+    ? { room: { name: 'Room' }, driver_status: {} } : method === 'groups.log' ? { events: [] } : {})
+  render(<CanonicalGroupWorkspace binding={binding} />)
+  await waitFor(() => expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Stuck draft'))
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(true)
+  fireEvent.click(screen.getByRole('button', { name: 'Discard unknown work' }))
+  await waitFor(() => expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(false))
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('Stuck draft')
+  await waitFor(async () => expect(await readCanonicalGroupSend(binding)).toBeUndefined())
+  expect(request.mock.calls.some(c => c[1] === 'groups.send')).toBe(false)
+})
+
+it('keeps the composer editable when a send exceeds the client text limit', async () => {
+  const binding = { connectionId: 'local', profile: 'team', roomId: 'oversize' }
+  request.mockImplementation(async (_route, method) => method === 'groups.state'
+    ? { room: { name: 'Room' }, driver_status: {} } : method === 'groups.log' ? { events: [] } : {})
+  render(<CanonicalGroupWorkspace binding={binding} />)
+  await screen.findByText('Room')
+  await waitFor(() => expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(false))
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'a'.repeat(64 * 1024 + 1) } })
+  fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+  await screen.findByText(/Group message text is too long/)
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).disabled).toBe(false)
+  expect(await readCanonicalGroupSend(binding)).toBeUndefined()
+  expect(request.mock.calls.some(c => c[1] === 'groups.send')).toBe(false)
+})
+
 it('blocks Send until journal restore and durable preparation complete', async () => {
   let releaseRead!: (value: string) => void
   let releaseWrite!: () => void

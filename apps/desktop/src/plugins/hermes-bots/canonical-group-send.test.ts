@@ -10,7 +10,7 @@ vi.mock('electron', () => ({ app: {}, ipcMain: {} }))
 // exercising the real atomic-file implementation in this Node fixture.
 const nativeModule = '../../../electron/prepared-submissions'
 const { preparedJournal } = await import(/* @vite-ignore */ nativeModule)
-import { prepareCanonicalGroupSend, readCanonicalGroupSend, retireCanonicalGroupSend } from './canonical-group-send'
+import { discardCanonicalGroupSend, prepareCanonicalGroupSend, readCanonicalGroupSend, retireCanonicalGroupSend } from './canonical-group-send'
 
 const binding = { connectionId: 'remote-a', profile: 'profile-a', roomId: 'room-a' }
 afterEach(() => vi.unstubAllGlobals())
@@ -74,4 +74,36 @@ test('native journal acknowledgement gates send and a failed write cannot downgr
   await expect(prepareCanonicalGroupSend(binding, { text: 'blocked' }).then(send)).rejects.toThrow('disk full')
   expect(send).toHaveBeenCalledOnce()
   expect(browserWrite).not.toHaveBeenCalled()
+})
+
+test('rejects over-limit UTF-8 text before journaling and discards only the exact intent', async () => {
+  const entries = new Map<string, string>()
+
+  const compareAndSet = vi.fn(async (key: string, _expected: string | null, entry: string | null) => {
+    if (entry === null) {entries.delete(key)} else {entries.set(key, entry)}
+
+    return { applied: true, current: entry }
+  })
+
+  vi.stubGlobal('window', { hermesDesktop: { preparedSubmissions: {
+    read: async () => JSON.stringify(Object.fromEntries([...entries].map(([key, value]) => [key, JSON.parse(value)]))),
+    compareAndSet
+  } } })
+
+  await expect(prepareCanonicalGroupSend(binding, { text: 'a'.repeat(64 * 1024 + 1) }))
+    .rejects.toThrow('Group message text is too long')
+  await expect(prepareCanonicalGroupSend(binding, { text: '\u00e9'.repeat(32 * 1024 + 1) }))
+    .rejects.toThrow('Group message text is too long')
+  expect(compareAndSet).not.toHaveBeenCalled()
+  expect(await readCanonicalGroupSend(binding)).toBeUndefined()
+
+  const atLimit = '\u00e9'.repeat(32 * 1024)
+  const prepared = await prepareCanonicalGroupSend(binding, { text: atLimit })
+  expect(prepared.params.payload.text).toBe(atLimit)
+
+  await discardCanonicalGroupSend(binding, 'stale-id')
+  expect(await readCanonicalGroupSend(binding)).toEqual(prepared)
+
+  await discardCanonicalGroupSend(binding, prepared.params.event_id)
+  expect(await readCanonicalGroupSend(binding)).toBeUndefined()
 })

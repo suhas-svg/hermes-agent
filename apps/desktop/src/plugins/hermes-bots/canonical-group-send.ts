@@ -1,6 +1,9 @@
 import type { CanonicalGroupBinding } from './canonical-groups'
 
 const STORAGE_KEY = 'hermes.desktop.canonicalGroupSends.v1'
+// Mirrors gateway.hosted_room_discussion.MAX_USER_TEXT_BYTES. Validate before the
+// durable journal so a deterministic backend rejection cannot strand the composer.
+const MAX_USER_TEXT_BYTES = 64 * 1024
 
 export interface PreparedCanonicalGroupSend {
   binding: CanonicalGroupBinding
@@ -82,6 +85,16 @@ export async function readCanonicalGroupSend(binding: CanonicalGroupBinding): Pr
   return validEntry(binding, key, (await readJournal())[key])
 }
 
+function validateText(text: unknown): void {
+  if (typeof text !== 'string') {return}
+
+  const bytes = new TextEncoder().encode(text).byteLength
+
+  if (bytes > MAX_USER_TEXT_BYTES) {
+    throw new Error(`Group message text is too long (${bytes} UTF-8 bytes; maximum ${MAX_USER_TEXT_BYTES})`)
+  }
+}
+
 // One unresolved intent per room. This is not an automatic outbox: callers show
 // the recovered payload and explicitly retry it rather than silently replacing it.
 // Create-if-absent at the journal owner: when another window won the slot first,
@@ -92,7 +105,11 @@ export async function prepareCanonicalGroupSend(
 ): Promise<PreparedCanonicalGroupSend> {
   const existing = await readCanonicalGroupSend(binding)
 
+  // An existing intent still wins over an invalid replacement: callers must be
+  // able to converge on the journaled send and explicitly retry or discard it.
   if (existing) {return existing}
+
+  validateText(payload.text)
 
   const eventId = crypto.randomUUID()
 
@@ -111,11 +128,22 @@ export async function prepareCanonicalGroupSend(
   return validEntry(binding, key, current === null ? undefined : JSON.parse(current)) ?? entry
 }
 
-// Call only after a definitive groups.send ACK; timeout/unknown retains the
-// exact event and payload. Compare-and-delete at the journal owner: a delayed or
-// wrong ACK whose intent was already replaced (fresh event_id) deletes nothing.
-export async function retireCanonicalGroupSend(binding: CanonicalGroupBinding, eventId: string): Promise<void> {
+// Compare-and-delete at the journal owner: a delayed or wrong ID whose intent
+// was already replaced (fresh event_id) deletes nothing.
+async function removeCanonicalGroupSend(binding: CanonicalGroupBinding, eventId: string): Promise<void> {
   const entry = await readCanonicalGroupSend(binding)
 
   if (entry?.params.event_id === eventId) {await compareAndSet(journalKey(binding), JSON.stringify(entry), null)}
+}
+
+// Call only after a definitive groups.send ACK; timeout/unknown retains the
+// exact event and payload.
+export async function retireCanonicalGroupSend(binding: CanonicalGroupBinding, eventId: string): Promise<void> {
+  await removeCanonicalGroupSend(binding, eventId)
+}
+
+// Drop an unconfirmed send at the user's explicit request. This can lose a send
+// the backend accepted, but compare-and-delete still protects a newer intent.
+export async function discardCanonicalGroupSend(binding: CanonicalGroupBinding, eventId: string): Promise<void> {
+  await removeCanonicalGroupSend(binding, eventId)
 }

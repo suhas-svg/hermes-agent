@@ -5,7 +5,7 @@ import { type CanonicalDriverActivity, CanonicalGroupRoster, CanonicalGroupWorki
 import { CanonicalGroupAttachments } from './canonical-group-attachments'
 import { type CanonicalGroupEvent, CanonicalGroupHistory } from './canonical-group-history'
 import { useCanonicalGroupLabels } from './canonical-group-labels'
-import { prepareCanonicalGroupSend, readCanonicalGroupSend, retireCanonicalGroupSend } from './canonical-group-send'
+import { discardCanonicalGroupSend, prepareCanonicalGroupSend, readCanonicalGroupSend, retireCanonicalGroupSend } from './canonical-group-send'
 import type { PreparedCanonicalGroupSend } from './canonical-group-send'
 import { actCanonicalGroup, canonicalGroupRequest } from './canonical-groups'
 import type { CanonicalGroupBinding, CanonicalPendingAction, CanonicalRoom } from './canonical-groups'
@@ -152,6 +152,28 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
     })
   }
 
+  const discardPreparedSend = () => {
+    const exact = pending
+
+    if (!exact) {return}
+
+    void mutate(async () => {
+      await discardCanonicalGroupSend(exact.binding, exact.params.event_id)
+
+      if (!alive.current) {return}
+
+      const held = heldDraft.current
+      heldDraft.current = null
+      setPending(null)
+
+      // Keep this window's typed draft when another window had claimed the slot.
+      if (held) {
+        setDraft(held.text)
+        setAttachments(held.attachments)
+      }
+    })
+  }
+
   const act = (action: CanonicalPendingAction, choice?: 'once' | 'deny') =>
     mutate(() => actCanonicalGroup(binding, action, choice))
 
@@ -185,7 +207,10 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
       <Button disabled={busy} onClick={() => { const exact = discard; setDiscard(null); void act(exact) }}>{labels.confirmDiscard}</Button>
       <Button onClick={() => setDiscard(null)}>{labels.cancel}</Button>
     </div>}
-    {pending && <p role="status">{labels.restoredPendingSend}</p>}
+    {pending && <div className="flex items-center gap-2">
+      <p role="status">{labels.restoredPendingSend}</p>
+      <Button aria-label={labels.discardUnknown} disabled={busy} onClick={discardPreparedSend} title={labels.discardWarning}>{labels.discard}</Button>
+    </div>}
     <form className="flex gap-2" onSubmit={event => { event.preventDefault(); send() }}>
       <CanonicalGroupAttachments attachments={attachments} binding={binding} disabled={composerLocked} onChange={setAttachments} onUploadingChange={setUploading} />
       <Textarea aria-label={labels.groupMessage} className="min-w-0 flex-1" disabled={composerLocked} onChange={e => setDraft(e.target.value)} value={draft} />
